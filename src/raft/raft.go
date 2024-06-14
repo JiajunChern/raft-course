@@ -60,8 +60,37 @@ type Raft struct {
 	// Your data here (PartA, PartB, PartC).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	role        Role
+	currentTerm int // 服务器已知最新的任期
+	votedFor    int // 当前任期内收到选票的 candidateId，如果没有投给任何候选人，则为空
 
+	// used for election loop
+	electionStart   time.Time
+	electionTimeout time.Duration
 }
+
+const (
+	electionTimeoutMin time.Duration = 250 * time.Millisecond
+	electionTimeoutMax time.Duration = 400 * time.Millisecond
+)
+
+func (rf *Raft) resetElectionTimerLocked() {
+	rf.electionStart = time.Now()
+	randRange := int64(electionTimeoutMax - electionTimeoutMin)
+	rf.electionTimeout = electionTimeoutMin + time.Duration(rand.Int63()%randRange) // 设置随机的超时时间
+}
+
+func (rf *Raft) isElectionTimeoutLocked() bool {
+	return time.Since(rf.electionStart) > rf.electionTimeout
+}
+
+type Role string
+
+const (
+	Follower  Role = "Follower"
+	Candidate Role = "Candidate"
+	Leader    Role = "Leader"
+) // 定义全局常量
 
 // return currentTerm and whether this server
 // believes it is the leader.
@@ -70,7 +99,58 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (PartA).
-	return term, isleader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	term = rf.currentTerm
+	isleader = rf.role == Leader
+	return term, isleader // 获取 Raft 相关状态
+}
+
+// become a follower in `term`, term could not be decreased
+func (rf *Raft) becomeFollowerLocked(term int) {
+	// 收到的 term 小于 currentTerm 不用理会收到的包
+	if term < rf.currentTerm {
+		LOG(rf.me, rf.currentTerm, DError, "Can't become Follower, lower term")
+		return
+	}
+
+	LOG(rf.me, rf.currentTerm, DLog, "%s -> Follower, For T%d->T%d",
+		rf.role, rf.currentTerm, term)
+
+	// important! Could only reset the `votedFor` when term increased
+	// 迈入新 term 需要重置投票
+	if term > rf.currentTerm {
+		rf.votedFor = -1
+	}
+	rf.role = Follower
+	rf.currentTerm = term
+}
+
+func (rf *Raft) becomeCandidateLocked() {
+	// 已经是 Leader 不用理会收到的包
+	if rf.role == Leader {
+		LOG(rf.me, rf.currentTerm, DError, "Leader can't become Candidate")
+		return
+	}
+
+	LOG(rf.me, rf.currentTerm, DVote, "%s -> Candidate, For T%d->T%d",
+		rf.role, rf.currentTerm, rf.currentTerm+1)
+	rf.role = Candidate
+	rf.currentTerm++    // 变成 Candidate 任期 + 1
+	rf.votedFor = rf.me // 变成 Candidate 先投自己
+}
+
+func (rf *Raft) becomeLeaderLocked() {
+	// 只有 Candidate 才能变成 Leader
+	if rf.role != Candidate {
+		LOG(rf.me, rf.currentTerm, DLeader,
+			"%s, Only candidate can become Leader", rf.role)
+		return
+	}
+
+	LOG(rf.me, rf.currentTerm, DLeader, "%s -> Leader, For T%d",
+		rf.role, rf.currentTerm)
+	rf.role = Leader
 }
 
 // save Raft's persistent state to stable storage,
@@ -124,17 +204,46 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (PartA, PartB).
+	Term        int
+	CandidateId int
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (PartA).
+	Term        int
+	VoteGranted bool // 要票结果
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (PartA, PartB).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// align the term
+	reply.Term = rf.currentTerm
+	if rf.currentTerm > args.Term {
+		LOG(rf.me, rf.currentTerm, DVote, "-> S%d, Reject vote, higher term, T%d>T%d", args.CandidateId, rf.currentTerm, args.Term)
+		reply.VoteGranted = false
+		return
+	}
+	if rf.currentTerm < args.Term {
+		rf.becomeFollowerLocked(args.Term)
+	}
+
+	// check the votedFor
+	if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
+		LOG(rf.me, rf.currentTerm, DVote, "-> S%d, Reject, Already voted S%d", args.CandidateId, rf.votedFor)
+		reply.VoteGranted = false
+		return
+	}
+
+	reply.VoteGranted = true
+	rf.votedFor = args.CandidateId
+	rf.resetElectionTimerLocked()
+	LOG(rf.me, rf.currentTerm, DVote, "-> S%d", args.CandidateId)
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -223,6 +332,92 @@ func (rf *Raft) ticker() {
 	}
 }
 
+func (rf *Raft) contextLostLocked(role Role, term int) bool {
+	return !(rf.currentTerm == term && rf.role == role)
+}
+
+func (rf *Raft) startElection(term int) bool {
+	// 针对每个 Peer 的 RequestVote 的请求和响应处理
+	votes := 0
+	askVoteFromPeer := func(peer int, args *RequestVoteArgs) {
+		// send RPC  to `peer` and handle the response
+		reply := &RequestVoteReply{}
+		ok := rf.sendRequestVote(peer, args, reply)
+
+		// handle the response
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		// 要票失败
+		if !ok {
+			LOG(rf.me, rf.currentTerm, DDebug, "Ask vote from %d, Lost or error", peer)
+			return
+		}
+
+		// align the term
+		// 1. 如果对方 Term 比自己小：无视请求，通过返回值“亮出”自己的 Term
+		// 2. 如果对方 Term 比自己大：乖乖跟上对方 Term，变成最“菜”的 Follower
+		if reply.Term > rf.currentTerm {
+			rf.becomeFollowerLocked(reply.Term)
+			return
+		}
+
+		// check the context
+		if rf.contextLostLocked(Candidate, term) {
+			LOG(rf.me, rf.currentTerm, DVote, "Lost context, abort RequestVoteReply in T%d", rf.currentTerm)
+			return
+		}
+
+		// count votes
+		if reply.VoteGranted {
+			votes++
+		}
+		if votes > len(rf.peers)/2 {
+			rf.becomeLeaderLocked()
+			// TODO: go rf.replicationTicker(term)
+		}
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// every time locked
+	if rf.contextLostLocked(Candidate, term) {
+		return false
+	}
+
+	for peer := 0; peer < len(rf.peers); peer++ {
+		if peer == rf.me {
+			votes++
+			continue
+		}
+
+		args := &RequestVoteArgs{
+			Term:        term,
+			CandidateId: rf.me,
+		}
+		go askVoteFromPeer(peer, args)
+	}
+
+	return true
+}
+
+func (rf *Raft) electionTicker() {
+	for !rf.killed() {
+		// Your code here (PartA)
+		// Check if a leader election should be started.
+		rf.mu.Lock()
+		if rf.role != Leader && rf.isElectionTimeoutLocked() { // 不是 Leader 且选举时间到
+			go rf.startElection(rf.currentTerm) // 开始向别的 peers 要票
+		}
+		rf.mu.Unlock()
+
+		// pause for a random amount of time between 50 and 350
+		// milliseconds.
+		ms := 50 + (rand.Int63() % 300)
+		time.Sleep(time.Duration(ms) * time.Millisecond) // 随机睡眠
+	}
+}
+
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -245,7 +440,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
-	go rf.ticker()
+	// go rf.ticker()
+	go rf.electionTicker()
 
 	return rf
 }
