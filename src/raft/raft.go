@@ -49,6 +49,25 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type LogEntry struct {
+	Term         int         // the log entry's term
+	CommandValid bool        // if it should be applied
+	Command      interface{} // the command should be applied to the state machine
+}
+
+type AppendEntriesArgs struct {
+	Term     int
+	LeaderId int
+
+	// used to probe the match point
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+
+	// used to update the follower's commitIndex
+	LeaderCommit int
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -72,6 +91,7 @@ type Raft struct {
 const (
 	electionTimeoutMin time.Duration = 250 * time.Millisecond
 	electionTimeoutMax time.Duration = 400 * time.Millisecond
+	replicateInterval  time.Duration = 200 * time.Millisecond
 )
 
 func (rf *Raft) resetElectionTimerLocked() {
@@ -96,13 +116,11 @@ const (
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
-	var term int
-	var isleader bool
 	// Your code here (PartA).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	term = rf.currentTerm
-	isleader = rf.role == Leader
+	term := rf.currentTerm
+	isleader := rf.role == Leader
 	return term, isleader // 获取 Raft 相关状态
 }
 
@@ -336,6 +354,94 @@ func (rf *Raft) contextLostLocked(role Role, term int) bool {
 	return !(rf.currentTerm == term && rf.role == role)
 }
 
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+
+	ConfilictIndex int
+	ConfilictTerm  int
+}
+
+// 心跳接收方在收到心跳时，只要 Leader 的 term 不小于自己，就对其进行认可，变为 Follower，并重置选举时钟，承诺一段时间内不发起选举。
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.currentTerm
+	reply.Success = false
+	// align the term
+	if args.Term < rf.currentTerm {
+		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject log", args.LeaderId)
+		return
+	}
+	rf.becomeFollowerLocked(args.Term)
+
+	// reset the timer
+	rf.resetElectionTimerLocked()
+	reply.Success = true
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+// 单轮心跳：对除自己外的所有 Peer 发送一个心跳 RPC
+func (rf *Raft) startReplication(term int) bool {
+
+	// 单次 RPC：对某个 Peer 来发送心跳，并且处理 RPC 返回值
+	replicateToPeer := func(peer int, args *AppendEntriesArgs) {
+		reply := &AppendEntriesReply{}
+		ok := rf.sendAppendEntries(peer, args, reply)
+
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		if !ok {
+			LOG(rf.me, rf.currentTerm, DLog, "-> S%d, Lost or crashed", peer)
+			return
+		}
+		// align the term
+		if reply.Term > rf.currentTerm {
+			rf.becomeFollowerLocked(reply.Term)
+			return
+		}
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.contextLostLocked(Leader, term) {
+		LOG(rf.me, rf.currentTerm, DLeader, "Leader[T%d] -> %s[T%d]", term, rf.role, rf.currentTerm)
+		return false
+	}
+
+	for peer := 0; peer < len(rf.peers); peer++ {
+		if peer == rf.me {
+			continue
+		}
+
+		args := &AppendEntriesArgs{
+			Term:     term,
+			LeaderId: rf.me,
+		}
+
+		go replicateToPeer(peer, args)
+	}
+
+	return true
+}
+
+// 心跳 Loop：在当选 Leader 后起一个后台线程，等间隔的发送心跳/复制日志
+func (rf *Raft) replicationTicker(term int) {
+	for !rf.killed() {
+		ok := rf.startReplication(term)
+		if !ok {
+			return
+		}
+
+		time.Sleep(replicateInterval)
+	}
+}
+
 func (rf *Raft) startElection(term int) bool {
 	// 针对每个 Peer 的 RequestVote 的请求和响应处理
 	votes := 0
@@ -373,7 +479,7 @@ func (rf *Raft) startElection(term int) bool {
 		}
 		if votes > len(rf.peers)/2 {
 			rf.becomeLeaderLocked()
-			// TODO: go rf.replicationTicker(term)
+			go rf.replicationTicker(term)
 		}
 	}
 
