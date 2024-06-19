@@ -132,8 +132,7 @@ func (rf *Raft) becomeFollowerLocked(term int) {
 		return
 	}
 
-	LOG(rf.me, rf.currentTerm, DLog, "%s -> Follower, For T%d->T%d",
-		rf.role, rf.currentTerm, term)
+	LOG(rf.me, rf.currentTerm, DLog, "%s -> Follower, For T%d->T%d", rf.role, rf.currentTerm, term)
 
 	// important! Could only reset the `votedFor` when term increased
 	// 迈入新 term 需要重置投票
@@ -151,8 +150,7 @@ func (rf *Raft) becomeCandidateLocked() {
 		return
 	}
 
-	LOG(rf.me, rf.currentTerm, DVote, "%s -> Candidate, For T%d->T%d",
-		rf.role, rf.currentTerm, rf.currentTerm+1)
+	LOG(rf.me, rf.currentTerm, DVote, "%s -> Candidate, For T%d->T%d", rf.role, rf.currentTerm, rf.currentTerm+1)
 	rf.role = Candidate
 	rf.currentTerm++    // 变成 Candidate 任期 + 1
 	rf.votedFor = rf.me // 变成 Candidate 先投自己
@@ -166,8 +164,7 @@ func (rf *Raft) becomeLeaderLocked() {
 		return
 	}
 
-	LOG(rf.me, rf.currentTerm, DLeader, "%s -> Leader, For T%d",
-		rf.role, rf.currentTerm)
+	LOG(rf.me, rf.currentTerm, DLeader, "%s -> Leader, For T%d", rf.role, rf.currentTerm)
 	rf.role = Leader
 }
 
@@ -350,7 +347,12 @@ func (rf *Raft) ticker() {
 	}
 }
 
+// 保证即在一个任期内，角色没有变化
 func (rf *Raft) contextLostLocked(role Role, term int) bool {
+	//LOG(rf.me, rf.currentTerm, DVote, "Check context, rf.currentTerm == term -> %t,  rf.role == role -> %t",
+	//	rf.currentTerm == term, rf.role == role)
+	//LOG(rf.me, rf.currentTerm, DVote, "Check context, !(rf.currentTerm == term && rf.role == role) -> %t",
+	//	!(rf.currentTerm == term && rf.role == role))
 	return !(rf.currentTerm == term && rf.role == role)
 }
 
@@ -488,6 +490,7 @@ func (rf *Raft) startElection(term int) bool {
 
 	// every time locked
 	if rf.contextLostLocked(Candidate, term) {
+		LOG(rf.me, rf.currentTerm, DVote, "Lost context, %s %d abort askVoteFromPeer in T%d", rf.role, rf.me, rf.currentTerm)
 		return false
 	}
 
@@ -496,7 +499,7 @@ func (rf *Raft) startElection(term int) bool {
 			votes++
 			continue
 		}
-
+		LOG(rf.me, rf.currentTerm, DDebug, "Try to ask vote from %d", peer)
 		args := &RequestVoteArgs{
 			Term:        term,
 			CandidateId: rf.me,
@@ -513,6 +516,8 @@ func (rf *Raft) electionTicker() {
 		// Check if a leader election should be started.
 		rf.mu.Lock()
 		if rf.role != Leader && rf.isElectionTimeoutLocked() { // 不是 Leader 且选举时间到
+			// 先变成候选人
+			rf.becomeCandidateLocked()
 			go rf.startElection(rf.currentTerm) // 开始向别的 peers 要票
 		}
 		rf.mu.Unlock()
@@ -541,6 +546,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (PartA, PartB, PartC).
+	rf.role = Follower
+	rf.currentTerm = 1
+	rf.votedFor = -1
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
