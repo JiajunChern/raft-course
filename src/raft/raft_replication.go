@@ -2,6 +2,12 @@ package raft
 
 import "time"
 
+type LogEntry struct {
+	Term         int         // the log entry's term
+	CommandValid bool        // if it should be applied
+	Command      interface{} // the command should be applied to the state machine
+}
+
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
@@ -35,11 +41,29 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject log", args.LeaderId)
 		return
 	}
-	rf.becomeFollowerLocked(args.Term)
+	if args.Term >= rf.currentTerm {
+		rf.becomeFollowerLocked(args.Term)
+	}
+
+	// return failure if the previous log not matched
+	if args.PrevLogIndex >= len(rf.log) {
+		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject Log, Follower log too short, Len:%d <= Prev:%d", args.LeaderId, len(rf.log), args.PrevLogIndex)
+		return
+	}
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		LOG(rf.me, rf.currentTerm, DLog2, "<- S%d, Reject Log, Prev log not match, [%d]: T%d != T%d", args.LeaderId, args.PrevLogIndex, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm)
+		return
+	}
+
+	// append the leader logs to local
+	rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+	LOG(rf.me, rf.currentTerm, DLog2, "Follower append logs: (%d, %d]", args.PrevLogIndex, args.PrevLogIndex+len(args.Entries))
+	reply.Success = true
+
+	// TODO: handle the args.LeaderCommit
 
 	// reset the timer
 	rf.resetElectionTimerLocked()
-	reply.Success = true
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -66,6 +90,25 @@ func (rf *Raft) startReplication(term int) bool {
 			rf.becomeFollowerLocked(reply.Term)
 			return
 		}
+
+		// probe the lower index if the prev log not matched
+		if !reply.Success {
+			idx := rf.nextIndex[peer] - 1
+			term := rf.log[idx].Term
+			for idx > 0 && rf.log[idx].Term == term {
+				idx--
+			}
+			rf.nextIndex[peer] = idx + 1
+			LOG(rf.me, rf.currentTerm, DLog, "Log not matched in %d, Update next=%d", args.PrevLogIndex, rf.nextIndex[peer])
+			return
+		}
+
+		// update the match/next index if log appended successfully
+		rf.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
+		rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+
+		// TODO: need compute the new commitIndex here,
+		// but we leave it to the other chapter
 	}
 
 	rf.mu.Lock()
@@ -77,14 +120,24 @@ func (rf *Raft) startReplication(term int) bool {
 
 	for peer := 0; peer < len(rf.peers); peer++ {
 		if peer == rf.me {
+			// Don't forget to update Leader's matchIndex
+			rf.matchIndex[peer] = len(rf.log) - 1
+			rf.nextIndex[peer] = len(rf.log)
 			continue
 		}
 
-		args := &AppendEntriesArgs{
-			Term:     term,
-			LeaderId: rf.me,
-		}
+		prevIdx := rf.nextIndex[peer] - 1
+		prevTerm := rf.log[prevIdx].Term
 
+		args := &AppendEntriesArgs{
+			Term:         term,
+			LeaderId:     rf.me,
+			PrevLogIndex: prevIdx,
+			PrevLogTerm:  prevTerm,
+			Entries:      rf.log[prevIdx+1:],
+			LeaderCommit: rf.commitIndex,
+		}
+		LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, Send log, Prev=[%d]T%d, Len()=%d", peer, args.PrevLogIndex, args.PrevLogTerm, len(args.Entries))
 		go replicateToPeer(peer, args)
 	}
 

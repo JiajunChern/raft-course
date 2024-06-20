@@ -49,12 +49,6 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
-type LogEntry struct {
-	Term         int         // the log entry's term
-	CommandValid bool        // if it should be applied
-	Command      interface{} // the command should be applied to the state machine
-}
-
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -70,9 +64,20 @@ type Raft struct {
 	currentTerm int // 服务器已知最新的任期
 	votedFor    int // 当前任期内收到选票的 candidateId，如果没有投给任何候选人，则为空
 
+	// fields for apply loop
+	commitIndex int
+
 	// used for election loop
 	electionStart   time.Time
 	electionTimeout time.Duration
+
+	// log in Peer's local
+	log []LogEntry
+
+	// only used when it is Leader,
+	// log view for each peer
+	nextIndex  []int // 日志同步时的匹配点试探
+	matchIndex []int // 日志同步成功后的匹配点记录
 }
 
 const (
@@ -143,6 +148,12 @@ func (rf *Raft) becomeLeaderLocked() {
 
 	LOG(rf.me, rf.currentTerm, DLeader, "%s -> Leader, For T%d", rf.role, rf.currentTerm)
 	rf.role = Leader
+
+	// 初始化 matchIndex 和 nextIndex
+	for peer := 0; peer < len(rf.peers); peer++ {
+		rf.nextIndex[peer] = len(rf.log)
+		rf.matchIndex[peer] = 0
+	}
 }
 
 // save Raft's persistent state to stable storage,
@@ -275,6 +286,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.role = Follower
 	rf.currentTerm = 1
 	rf.votedFor = -1
+
+	// a dummy entry to avoid lots of corner checks
+	rf.log = append(rf.log, LogEntry{})
+
+	// initialize the leader's view slice
+	rf.matchIndex = make([]int, len(rf.peers))
+	rf.nextIndex = make([]int, len(rf.peers))
+
+	// initialize the fields used for apply
+	rf.commitIndex = 0
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

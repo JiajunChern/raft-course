@@ -9,8 +9,10 @@ import (
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (PartA, PartB).
-	Term        int
-	CandidateId int
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 // example RequestVote RPC reply structure.
@@ -29,6 +31,17 @@ func (rf *Raft) resetElectionTimerLocked() {
 
 func (rf *Raft) isElectionTimeoutLocked() bool {
 	return time.Since(rf.electionStart) > rf.electionTimeout
+}
+
+func (rf *Raft) isMoreUpToDateLocked(candidateIndex, candidateTerm int) bool {
+	l := len(rf.log)
+	lastTerm, lastIndex := rf.log[l-1].Term, l-1
+	LOG(rf.me, rf.currentTerm, DVote, "Compare last log, Me: [%d]T%d, Candidate: [%d]T%d", lastIndex, lastTerm, candidateIndex, candidateTerm)
+
+	if lastTerm != candidateTerm {
+		return lastTerm > candidateTerm
+	}
+	return lastIndex > candidateIndex
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -71,9 +84,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// align the term
 	reply.Term = rf.currentTerm
+	reply.VoteGranted = false
 	if rf.currentTerm > args.Term {
 		LOG(rf.me, rf.currentTerm, DVote, "-> S%d, Reject vote, higher term, T%d>T%d", args.CandidateId, rf.currentTerm, args.Term)
-		reply.VoteGranted = false
 		return
 	}
 	if rf.currentTerm < args.Term {
@@ -83,7 +96,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// check the votedFor
 	if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
 		LOG(rf.me, rf.currentTerm, DVote, "-> S%d, Reject, Already voted S%d", args.CandidateId, rf.votedFor)
-		reply.VoteGranted = false
+		return
+	}
+
+	// check log, only grant vote when the candidates have more up-to-date log
+	if rf.isMoreUpToDateLocked(args.LastLogIndex, args.LastLogTerm) {
+		LOG(rf.me, rf.currentTerm, DVote, "-> S%d, Reject Vote, S%d's log less up-to-date", args.CandidateId)
 		return
 	}
 
@@ -162,6 +180,7 @@ func (rf *Raft) startElection(term int) bool {
 		return false
 	}
 
+	l := len(rf.log)
 	for peer := 0; peer < len(rf.peers); peer++ {
 		if peer == rf.me {
 			votes++
@@ -169,8 +188,10 @@ func (rf *Raft) startElection(term int) bool {
 		}
 		LOG(rf.me, rf.currentTerm, DDebug, "Try to ask vote from %d", peer)
 		args := &RequestVoteArgs{
-			Term:        term,
-			CandidateId: rf.me,
+			Term:         term,
+			CandidateId:  rf.me,
+			LastLogIndex: l - 1,
+			LastLogTerm:  rf.log[l-1].Term,
 		}
 		go askVoteFromPeer(peer, args)
 	}
