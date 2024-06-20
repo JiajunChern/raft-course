@@ -1,6 +1,9 @@
 package raft
 
-import "time"
+import (
+	"sort"
+	"time"
+)
 
 type LogEntry struct {
 	Term         int         // the log entry's term
@@ -61,6 +64,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 
 	// TODO: handle the args.LeaderCommit
+	// update the commit index if needed and indicate the apply loop to apply
+	if args.LeaderCommit > rf.commitIndex {
+		LOG(rf.me, rf.currentTerm, DApply, "Follower update the commit index %d->%d", rf.commitIndex, args.LeaderCommit)
+		rf.commitIndex = args.LeaderCommit
+		if rf.commitIndex >= len(rf.log) {
+			rf.commitIndex = len(rf.log) - 1
+		}
+		rf.applyCond.Signal()
+	}
 
 	// reset the timer
 	rf.resetElectionTimerLocked()
@@ -69,6 +81,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
+}
+
+func (rf *Raft) getMajorityIndexLocked() int {
+	// TODO(spw): may could be avoided copying
+	tmpIndexes := make([]int, len(rf.matchIndex))
+	copy(tmpIndexes, rf.matchIndex)
+	sort.Ints(tmpIndexes)
+	majorityIdx := (len(tmpIndexes) - 1) / 2
+	LOG(rf.me, rf.currentTerm, DDebug, "Match index after sort: %v, majority[%d]=%d", tmpIndexes, majorityIdx, tmpIndexes[majorityIdx])
+	return tmpIndexes[majorityIdx] // min -> max
 }
 
 // 单轮心跳：对除自己外的所有 Peer 发送一个心跳 RPC
@@ -85,9 +107,16 @@ func (rf *Raft) startReplication(term int) bool {
 			LOG(rf.me, rf.currentTerm, DLog, "-> S%d, Lost or crashed", peer)
 			return
 		}
+
 		// align the term
 		if reply.Term > rf.currentTerm {
 			rf.becomeFollowerLocked(reply.Term)
+			return
+		}
+
+		// check context lost
+		if rf.contextLostLocked(Leader, term) {
+			LOG(rf.me, rf.currentTerm, DLog, "-> S%d, Context Lost, T%d:Leader->T%d:%s", peer, term, rf.currentTerm, rf.role)
 			return
 		}
 
@@ -109,6 +138,15 @@ func (rf *Raft) startReplication(term int) bool {
 
 		// TODO: need compute the new commitIndex here,
 		// but we leave it to the other chapter
+		// update the commmit index if log appended successfully
+		rf.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
+		rf.nextIndex[peer] = rf.matchIndex[peer] + 1 // important: must update
+		majorityMatched := rf.getMajorityIndexLocked()
+		if majorityMatched > rf.commitIndex {
+			LOG(rf.me, rf.currentTerm, DApply, "Leader update the commit index %d->%d", rf.commitIndex, majorityMatched)
+			rf.commitIndex = majorityMatched
+			rf.applyCond.Signal()
+		}
 	}
 
 	rf.mu.Lock()
