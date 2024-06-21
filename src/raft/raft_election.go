@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"math/rand"
 	"time"
 )
@@ -44,6 +45,13 @@ func (rf *Raft) isMoreUpToDateLocked(candidateIndex, candidateTerm int) bool {
 	return lastIndex > candidateIndex
 }
 
+func (args *RequestVoteArgs) String() string {
+	return fmt.Sprintf("Candidate-%d T%d, Last:[%d]T%d", args.CandidateId, args.Term, args.LastLogIndex, args.LastLogTerm)
+}
+func (reply *RequestVoteReply) String() string {
+	return fmt.Sprintf("T%d, VoteGranted: %v", reply.Term, reply.VoteGranted)
+}
+
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
 // expects RPC arguments in args.
@@ -81,6 +89,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (PartA, PartB).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	LOG(rf.me, rf.currentTerm, DDebug, "<- S%d, VoteAsked, Args=%v", args.CandidateId, args.String())
 
 	// align the term
 	reply.Term = rf.currentTerm
@@ -107,6 +116,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	reply.VoteGranted = true
 	rf.votedFor = args.CandidateId
+	rf.persistLocked()
 	rf.resetElectionTimerLocked()
 	LOG(rf.me, rf.currentTerm, DVote, "-> S%d", args.CandidateId)
 }
@@ -146,6 +156,7 @@ func (rf *Raft) startElection(term int) bool {
 			LOG(rf.me, rf.currentTerm, DDebug, "Ask vote from %d, Lost or error", peer)
 			return
 		}
+		LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, AskVote Reply=%v", peer, reply.String())
 
 		// align the term
 		// 1. 如果对方 Term 比自己小：无视请求，通过返回值“亮出”自己的 Term
@@ -186,13 +197,13 @@ func (rf *Raft) startElection(term int) bool {
 			votes++
 			continue
 		}
-		LOG(rf.me, rf.currentTerm, DDebug, "Try to ask vote from %d", peer)
 		args := &RequestVoteArgs{
 			Term:         term,
 			CandidateId:  rf.me,
 			LastLogIndex: l - 1,
 			LastLogTerm:  rf.log[l-1].Term,
 		}
+		LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, AskVote, Args=%v", peer, args.String())
 		go askVoteFromPeer(peer, args)
 	}
 
