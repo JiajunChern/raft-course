@@ -33,7 +33,7 @@ func (rf *Raft) persistLocked() {
 	rf.log.persist(e)
 	raftState := w.Bytes()
 	// leave the second parameter nil, will use it in PartD
-	rf.persister.Save(raftState, nil)
+	rf.persister.Save(raftState, rf.log.snapshot)
 	LOG(rf.me, rf.currentTerm, DPersist, "Persist: %v", rf.stateString())
 }
 
