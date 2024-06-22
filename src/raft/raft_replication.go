@@ -174,7 +174,7 @@ func (rf *Raft) startReplication(term int) bool {
 
 		// TODO: need compute the new commitIndex here,
 		// but we leave it to the other chapter
-		// update the commmit index if log appended successfully
+		// update the commit index if log appended successfully
 		rf.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
 		rf.nextIndex[peer] = rf.matchIndex[peer] + 1 // important: must update
 		majorityMatched := rf.getMajorityIndexLocked()
