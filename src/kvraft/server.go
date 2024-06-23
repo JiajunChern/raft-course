@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"course/labgob"
 	"course/labrpc"
 	"course/raft"
@@ -73,10 +74,13 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	kv.mu.Unlock()
 	// Your code here.
+	// 调用 raft，将请求存储到 raft 日志中并进行同步
 	index, _, isLeader := kv.rf.Start(Op{
-		Key:    args.Key,
-		Value:  args.Value,
-		OpType: getOperationType(args.Op),
+		Key:      args.Key,
+		Value:    args.Value,
+		OpType:   getOperationType(args.Op),
+		ClientId: args.ClientId,
+		SeqId:    args.SeqId,
 	})
 
 	// 如果不是 Leader 的话，直接返回错误
@@ -154,6 +158,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.dead = 0
 	kv.lastApplied = 0
 	kv.stateMachine = NewMemoryKVStateMachine()
+	kv.notifyChans = make(map[int]chan *OpReply)
+	kv.duplicateTable = make(map[int64]LastOperationInfo)
+
+	// 从 snapshot 中恢复状态
+	kv.restoreFromSnapshot(persister.ReadSnapshot())
 
 	go kv.applyTask()
 	return kv
@@ -195,6 +204,16 @@ func (kv *KVServer) applyTask() {
 					notifyCh <- opReply
 				}
 
+				// 判断是否需要 snapshot
+				if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() >= kv.maxraftstate {
+					kv.makeSnapshot(message.CommandIndex)
+				}
+
+				kv.mu.Unlock()
+			} else if message.SnapshotValid {
+				kv.mu.Lock()
+				kv.restoreFromSnapshot(message.Snapshot)
+				kv.lastApplied = message.SnapshotIndex
 				kv.mu.Unlock()
 			}
 		}
@@ -224,4 +243,29 @@ func (kv *KVServer) getNotifyChannel(index int) chan *OpReply {
 
 func (kv *KVServer) removeNotifyChannel(index int) {
 	delete(kv.notifyChans, index)
+}
+
+func (kv *KVServer) makeSnapshot(index int) {
+	buf := new(bytes.Buffer)
+	enc := labgob.NewEncoder(buf)
+	_ = enc.Encode(kv.stateMachine)
+	_ = enc.Encode(kv.duplicateTable)
+	kv.rf.Snapshot(index, buf.Bytes())
+}
+
+func (kv *KVServer) restoreFromSnapshot(snapshot []byte) {
+	if len(snapshot) == 0 {
+		return
+	}
+
+	buf := bytes.NewBuffer(snapshot)
+	dec := labgob.NewDecoder(buf)
+	var stateMachine MemoryKVStateMachine
+	var dupTable map[int64]LastOperationInfo
+	if dec.Decode(&stateMachine) != nil || dec.Decode(&dupTable) != nil {
+		panic("failed to restore state from snapshpt")
+	}
+
+	kv.stateMachine = &stateMachine
+	kv.duplicateTable = dupTable
 }

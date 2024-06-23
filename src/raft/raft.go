@@ -88,7 +88,8 @@ type Raft struct {
 const (
 	electionTimeoutMin time.Duration = 250 * time.Millisecond
 	electionTimeoutMax time.Duration = 400 * time.Millisecond
-	replicateInterval  time.Duration = 70 * time.Millisecond
+	// todo: 修改 70 -> 30 通过 RaftKV TestSpeedA
+	replicateInterval time.Duration = 30 * time.Millisecond
 )
 
 type Role string
@@ -114,6 +115,12 @@ func (rf *Raft) GetState() (int, bool) {
 	term := rf.currentTerm
 	isleader := rf.role == Leader
 	return term, isleader // 获取 Raft 相关状态
+}
+
+func (rf *Raft) GetRaftStateSize() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.persister.RaftStateSize()
 }
 
 // become a follower in `term`, term could not be decreased
