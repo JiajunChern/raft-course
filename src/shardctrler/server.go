@@ -18,7 +18,7 @@ type ShardCtrler struct {
 	// Your data here.
 	dead           int32 // set by Kill()
 	lastApplied    int
-	stateMachine   *MemoryKVStateMachine
+	stateMachine   *CtrlerStateMachine
 	notifyChans    map[int]chan *OpReply
 	duplicateTable map[int64]LastOperationInfo
 
@@ -154,7 +154,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	// Your code here.
 	sc.dead = 0
 	sc.lastApplied = 0
-	sc.stateMachine = nil // todo
+	sc.stateMachine = NewCtrlerStateMachine()
 	sc.notifyChans = make(map[int]chan *OpReply)
 	sc.duplicateTable = make(map[int64]LastOperationInfo)
 
@@ -211,8 +211,19 @@ func (sc *ShardCtrler) requestDuplicated(clientId, seqId int64) bool {
 }
 
 func (sc *ShardCtrler) applyToStateMachine(op Op) *OpReply {
-	// TODO
-	return nil
+	var err Err
+	var cfg Config
+	switch op.OpType {
+	case OpQuery:
+		cfg, err = sc.stateMachine.Query(op.Num)
+	case OpJoin:
+		err = sc.stateMachine.Join(op.Servers)
+	case OpLeave:
+		err = sc.stateMachine.Leave(op.GIDs)
+	case OpMove:
+		err = sc.stateMachine.Move(op.Shard, op.GID)
+	}
+	return &OpReply{ControllerConfig: cfg, Err: err}
 }
 
 func (sc *ShardCtrler) getNotifyChannel(index int) chan *OpReply {
