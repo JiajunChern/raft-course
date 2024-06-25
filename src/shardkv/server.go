@@ -24,7 +24,7 @@ type ShardKV struct {
 	// Your definitions here.
 	dead           int32
 	lastApplied    int
-	stateMachine   *MemoryKVStateMachine
+	shards         map[int]*MemoryKVStateMachine
 	notifyChans    map[int]chan *OpReply
 	duplicateTable map[int64]LastOperationInfo
 	currentConfig  shardctrler.Config
@@ -43,7 +43,10 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Unlock()
 
 	// 调用 raft，将请求存储到 raft 日志中并进行同步
-	index, _, isLeader := kv.rf.Start(Op{Key: args.Key, OpType: OpGet})
+	index, _, isLeader := kv.rf.Start(RaftCommand{
+		ClientOpeartion,
+		Op{Key: args.Key, OpType: OpGet},
+	})
 
 	// 如果不是 Leader 的话，直接返回错误
 	if !isLeader {
@@ -93,12 +96,15 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Unlock()
 
 	// 调用 raft，将请求存储到 raft 日志中并进行同步
-	index, _, isLeader := kv.rf.Start(Op{
-		Key:      args.Key,
-		Value:    args.Value,
-		OpType:   getOperationType(args.Op),
-		ClientId: args.ClientId,
-		SeqId:    args.SeqId,
+	index, _, isLeader := kv.rf.Start(RaftCommand{
+		ClientOpeartion,
+		Op{
+			Key:      args.Key,
+			Value:    args.Value,
+			OpType:   getOperationType(args.Op),
+			ClientId: args.ClientId,
+			SeqId:    args.SeqId,
+		},
 	})
 
 	// 如果不是 Leader 的话，直接返回错误
@@ -190,7 +196,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.dead = 0
 	kv.lastApplied = 0
-	kv.stateMachine = NewMemoryKVStateMachine()
+	kv.shards = make(map[int]*MemoryKVStateMachine)
 	kv.notifyChans = make(map[int]chan *OpReply)
 	kv.duplicateTable = make(map[int64]LastOperationInfo)
 	kv.currentConfig = shardctrler.DefaultConfig()
@@ -213,16 +219,16 @@ func (kv *ShardKV) requestDuplicated(clientId, seqId int64) bool {
 	return ok && seqId <= info.SeqId
 }
 
-func (kv *ShardKV) applyToStateMachine(op Op) *OpReply {
+func (kv *ShardKV) applyToStateMachine(op Op, shardId int) *OpReply {
 	var value string
 	var err Err
 	switch op.OpType {
 	case OpGet:
-		value, err = kv.stateMachine.Get(op.Key)
+		value, err = kv.shards[shardId].Get(op.Key)
 	case OpPut:
-		err = kv.stateMachine.Put(op.Key, op.Value)
+		err = kv.shards[shardId].Put(op.Key, op.Value)
 	case OpAppend:
-		err = kv.stateMachine.Append(op.Key, op.Value)
+		err = kv.shards[shardId].Append(op.Key, op.Value)
 	}
 	return &OpReply{Value: value, Err: err}
 }
@@ -241,7 +247,7 @@ func (kv *ShardKV) removeNotifyChannel(index int) {
 func (kv *ShardKV) makeSnapshot(index int) {
 	buf := new(bytes.Buffer)
 	enc := labgob.NewEncoder(buf)
-	_ = enc.Encode(kv.stateMachine)
+	_ = enc.Encode(kv.shards)
 	_ = enc.Encode(kv.duplicateTable)
 	kv.rf.Snapshot(index, buf.Bytes())
 }
@@ -253,75 +259,12 @@ func (kv *ShardKV) restoreFromSnapshot(snapshot []byte) {
 
 	buf := bytes.NewBuffer(snapshot)
 	dec := labgob.NewDecoder(buf)
-	var stateMachine MemoryKVStateMachine
+	var stateMachine map[int]*MemoryKVStateMachine
 	var dupTable map[int64]LastOperationInfo
 	if dec.Decode(&stateMachine) != nil || dec.Decode(&dupTable) != nil {
 		panic("failed to restore state from snapshpt")
 	}
 
-	kv.stateMachine = &stateMachine
+	kv.shards = stateMachine
 	kv.duplicateTable = dupTable
-}
-
-// 处理 apply 任务
-func (kv *ShardKV) applyTask() {
-	for !kv.killed() {
-		select {
-		case message := <-kv.applyCh:
-			if message.CommandValid {
-				kv.mu.Lock()
-				// 如果是已经处理过的消息则直接忽略
-				if message.CommandIndex <= kv.lastApplied {
-					kv.mu.Unlock()
-					continue
-				}
-				kv.lastApplied = message.CommandIndex
-
-				// 取出用户的操作信息
-				op := message.Command.(Op)
-				var opReply *OpReply
-				if op.OpType != OpGet && kv.requestDuplicated(op.ClientId, op.SeqId) {
-					opReply = kv.duplicateTable[op.ClientId].Reply
-				} else {
-					// 将操作应用状态机中
-					opReply = kv.applyToStateMachine(op)
-					if op.OpType != OpGet {
-						kv.duplicateTable[op.ClientId] = LastOperationInfo{
-							SeqId: op.SeqId,
-							Reply: opReply,
-						}
-					}
-				}
-
-				// 将结果发送回去
-				if _, isLeader := kv.rf.GetState(); isLeader {
-					notifyCh := kv.getNotifyChannel(message.CommandIndex)
-					notifyCh <- opReply
-				}
-
-				// 判断是否需要 snapshot
-				if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() >= kv.maxraftstate {
-					kv.makeSnapshot(message.CommandIndex)
-				}
-
-				kv.mu.Unlock()
-			} else if message.SnapshotValid {
-				kv.mu.Lock()
-				kv.restoreFromSnapshot(message.Snapshot)
-				kv.lastApplied = message.SnapshotIndex
-				kv.mu.Unlock()
-			}
-		}
-	}
-}
-
-// 获取当前配置
-func (kv *ShardKV) fetchConfigTask() {
-	for !kv.killed() {
-		kv.mu.Lock()
-		newConfig := kv.mck.Query(-1)
-		kv.currentConfig = newConfig
-		kv.mu.Unlock()
-		time.Sleep(FetchConfigInterval)
-	}
 }
