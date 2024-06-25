@@ -24,19 +24,7 @@ func (kv *ShardKV) applyTask() {
 				if raftCommand.CmdType == ClientOperation {
 					// 取出用户的操作信息
 					op := raftCommand.Data.(Op)
-					if op.OpType != OpGet && kv.requestDuplicated(op.ClientId, op.SeqId) {
-						opReply = kv.duplicateTable[op.ClientId].Reply
-					} else {
-						// 将操作应用状态机中
-						shardId := key2shard(op.Key)
-						opReply = kv.applyToStateMachine(op, shardId)
-						if op.OpType != OpGet {
-							kv.duplicateTable[op.ClientId] = LastOperationInfo{
-								SeqId: op.SeqId,
-								Reply: opReply,
-							}
-						}
-					}
+					opReply = kv.applyClientOperation(op)
 				} else {
 					opReply = kv.handleConfigChangeMessage(raftCommand)
 				}
@@ -67,13 +55,25 @@ func (kv *ShardKV) applyTask() {
 func (kv *ShardKV) fetchConfigTask() {
 	for !kv.killed() {
 		if _, isLeader := kv.rf.GetState(); isLeader {
-
+			needFetch := true
 			kv.mu.Lock()
-			newConfig := kv.mck.Query(kv.currentConfig.Num + 1)
+			// 如果有 shard 的状态是非 Normal 的，则说明前一个配置变更的任务正在进行中
+			for _, shard := range kv.shards {
+				if shard.Status != Normal {
+					needFetch = false
+					break
+				}
+			}
+			currentNum := kv.currentConfig.Num
 			kv.mu.Unlock()
 
-			// 传入 raft 模块进行同步
-			kv.ConfigCommand(RaftCommand{ConfigChange, newConfig}, &OpReply{})
+			if needFetch {
+				newConfig := kv.mck.Query(currentNum + 1)
+				// 传入 raft 模块进行同步
+				if newConfig.Num == currentNum+1 {
+					kv.ConfigCommand(RaftCommand{ConfigChange, newConfig}, &OpReply{})
+				}
+			}
 		}
 		time.Sleep(FetchConfigInterval)
 	}
@@ -161,4 +161,76 @@ func (kv *ShardKV) GetShardsData(args *ShardOperationArgs, reply *ShardOperation
 	}
 
 	reply.ConfigNum, reply.Err = args.ConfigNum, OK
+}
+
+func (kv *ShardKV) shardGCTask() {
+	for !kv.killed() {
+
+		if _, isLeader := kv.rf.GetState(); isLeader {
+			kv.mu.Lock()
+			gidToShards := kv.getShardByStatus(GC)
+			var wg sync.WaitGroup
+			for gid, shardIds := range gidToShards {
+				wg.Add(1)
+				go func(servers []string, configNum int, shardIds []int) {
+					wg.Done()
+					shardGCArgs := ShardOperationArgs{configNum, shardIds}
+					for _, server := range servers {
+						var shardGCReply ShardOperationReply
+						clientEnd := kv.make_end(server)
+						ok := clientEnd.Call("ShardKV.DeleteShardsData", &shardGCArgs, &shardGCReply)
+						if ok && shardGCReply.Err == OK {
+							kv.ConfigCommand(RaftCommand{ShardGC, shardGCArgs}, &OpReply{})
+						}
+					}
+				}(kv.prevConfig.Groups[gid], kv.currentConfig.Num, shardIds)
+			}
+			kv.mu.Unlock()
+			wg.Wait()
+		}
+
+		time.Sleep(ShardGCInterval)
+	}
+}
+
+func (kv *ShardKV) DeleteShardsData(args *ShardOperationArgs, reply *ShardOperationReply) {
+	// 只需要从 Leader 获取数据
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	if kv.currentConfig.Num > args.ConfigNum {
+		reply.Err = OK
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+
+	var opReply OpReply
+	kv.ConfigCommand(RaftCommand{ShardGC, *args}, &opReply)
+
+	reply.Err = opReply.Err
+}
+
+func (kv *ShardKV) applyClientOperation(op Op) *OpReply {
+	if kv.matchGroup(op.Key) {
+		var opReply *OpReply
+		if op.OpType != OpGet && kv.requestDuplicated(op.ClientId, op.SeqId) {
+			opReply = kv.duplicateTable[op.ClientId].Reply
+		} else {
+			// 将操作应用状态机中
+			shardId := key2shard(op.Key)
+			opReply = kv.applyToStateMachine(op, shardId)
+			if op.OpType != OpGet {
+				kv.duplicateTable[op.ClientId] = LastOperationInfo{
+					SeqId: op.SeqId,
+					Reply: opReply,
+				}
+			}
+		}
+		return opReply
+	}
+	return &OpReply{Err: ErrWrongGroup}
 }
